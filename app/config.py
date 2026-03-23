@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[misc]
     @property
     def redis_url(self) -> str:
+        import os
+        # Railway injects REDIS_URL directly
+        raw = os.getenv("REDIS_URL", "")
+        if raw:
+            return raw
         return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/0"
 
     @computed_field  # type: ignore[misc]
