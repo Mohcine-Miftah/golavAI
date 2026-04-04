@@ -207,39 +207,34 @@ async def create_slot_hold(
 async def confirm_booking(
     session: AsyncSession,
     conversation_id: str,
-    hold_id: str,
     vehicle_category: str,
     service_type: str,
     address_text: str,
     area_name: str,
     customer_id: str,
     vehicle_model: str | None = None,
+    hold_id: str | None = None,  # Kept for backward compatibility, but ignored
 ) -> dict:
     """
     Atomically confirm a booking.
-
-    CRITICAL: Uses SELECT FOR UPDATE NOWAIT to lock the hold row.
-    If the hold is expired or doesn't exist, raises SlotHoldExpiredError.
-    The entire operation is inside a single DB transaction.
-
-    Returns:
-        {"booking_id": str, "status": "confirmed", "scheduled_start": str, "price_mad": float}
     """
     now_utc = datetime.now(UTC)
 
-    # Lock the hold row — raises if another transaction has it
+    # Find the active hold for this conversation
     result = await session.execute(
         select(BookingSlotHold)
         .where(
-            BookingSlotHold.id == uuid.UUID(hold_id),
             BookingSlotHold.conversation_id == uuid.UUID(conversation_id),
+            BookingSlotHold.status == "active"
         )
+        .order_by(BookingSlotHold.created_at.desc())
+        .limit(1)
         .with_for_update(nowait=True)
     )
     hold = result.scalar_one_or_none()
 
     if hold is None:
-        raise SlotHoldExpiredError(f"Hold {hold_id} not found for conversation {conversation_id}.")
+        raise SlotHoldExpiredError(f"No active hold found for conversation {conversation_id}.")
 
     if hold.status != "active":
         raise SlotHoldExpiredError(f"Hold {hold_id} is no longer active (status={hold.status}).")

@@ -13,6 +13,21 @@ from app.models.pricing_rule import PricingRule
 logger = get_logger(__name__)
 
 
+def normalize_price_params(category: str, service: str) -> tuple[str, str]:
+    """Normalize input strings to match DB keys (lowercase, no accents, common synonyms)."""
+    cat = category.lower().strip()
+    # Map synonyms/accents
+    if cat in ("citadine", "petit", "petite", "small"): cat = "citadine"
+    if cat in ("berline", "moyen", "medium"): cat = "berline"
+    if cat in ("suv", "4x4", "grand", "grande", "large"): cat = "suv"
+
+    srv = service.lower().strip()
+    if srv in ("exterieur", "extérieur", "outside", "simple"): srv = "exterieur"
+    if srv in ("complet", "complete", "full", "intérieur + extérieur"): srv = "complet"
+
+    return cat, srv
+
+
 async def get_price(
     session: AsyncSession,
     vehicle_category: str,
@@ -22,17 +37,19 @@ async def get_price(
     Fetch the active price for a vehicle category + service type.
     Raises GolavBaseError if no active pricing rule found.
     """
+    cat, srv = normalize_price_params(vehicle_category, service_type)
+
     result = await session.execute(
         select(PricingRule).where(
-            PricingRule.vehicle_category == vehicle_category.lower(),
-            PricingRule.service_type == service_type.lower(),
+            PricingRule.vehicle_category == cat,
+            PricingRule.service_type == srv,
             PricingRule.active == True,
         ).order_by(PricingRule.effective_from.desc()).limit(1)
     )
     rule = result.scalar_one_or_none()
     if rule is None:
-        logger.error("pricing_rule_missing", category=vehicle_category, service=service_type)
-        raise GolavBaseError(f"No active pricing rule for {vehicle_category}/{service_type}")
+        logger.error("pricing_rule_missing", category=cat, service=srv, original=(vehicle_category, service_type))
+        raise GolavBaseError(f"No active pricing rule for {cat}/{srv}")
     return rule.price_mad
 
 

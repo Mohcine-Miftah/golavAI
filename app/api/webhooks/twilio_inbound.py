@@ -109,8 +109,8 @@ async def twilio_inbound_webhook(
     )
     session.add(msg)
 
-    # 8. Mark event as processing
-    event.processing_status = "processing"
+    # 8. Mark event as pending (the worker will transition to processing)
+    event.processing_status = "pending"
 
     await session.commit()
 

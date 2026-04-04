@@ -1,14 +1,5 @@
 """
 app/workers/tasks/process_inbound.py — AI orchestration Celery task.
-
-This is the main worker that:
-1. Loads conversation context (customer, messages, open booking)
-2. Checks if the conversation is escalated (if so, stop)
-3. Calls OpenAI with the conversation history
-4. Validates the structured output
-5. Executes proposed tool calls
-6. Writes outbound message(s) to the outbox
-7. Updates the inbound_event processing_status
 """
 import asyncio
 import uuid
@@ -68,91 +59,102 @@ async def _process(
     from app.db.session import AsyncSessionLocal
     from app.models.conversation import Conversation
     from app.models.inbound_event import InboundEvent
-    from app.models.message import Message
-    from app.models.outbound_message import OutboundMessage
     from sqlalchemy import select
 
     async with AsyncSessionLocal() as session:
-        # Load conversation — check escalation flag
+        # 1. LOCK & CHECK IDEMPOTENCY
+        event_result = await session.execute(
+            select(InboundEvent).where(InboundEvent.id == uuid.UUID(inbound_event_id)).with_for_update()
+        )
+        event = event_result.scalar_one_or_none()
+        
+        if not event:
+            logger.error("inbound_event_not_found", event_id=inbound_event_id)
+            return
+
+        current_retries = getattr(task.request, "retries", 0)
+        is_stale = False
+        if event.updated_at:
+            diff = datetime.now(timezone.utc) - event.updated_at
+            if diff.total_seconds() > 300:
+                is_stale = True
+
+        if event.processing_status == "processed":
+            logger.info("event_already_processed_skip", event_id=inbound_event_id)
+            return
+
+        if event.processing_status == "processing" and current_retries == 0 and not is_stale:
+            logger.info("event_currently_processing_skip", event_id=inbound_event_id)
+            return
+
+        # Mark as processing
+        event.processing_status = "processing"
+        await session.flush()
+
+        # 2. LOAD CONVERSATION
         conv_result = await session.execute(
             select(Conversation).where(Conversation.id == uuid.UUID(conversation_id))
         )
         conversation = conv_result.scalar_one_or_none()
 
-        if conversation is None:
-            logger.error("conversation_not_found", conv_id=conversation_id)
-            return
-
-        if conversation.escalated:
-            logger.info("conversation_escalated_skip", conv_id=conversation_id)
-            await _mark_event_done(session, inbound_event_id)
+        if conversation is None or conversation.escalated:
+            logger.info("conversation_skip", conv_id=conversation_id, escalated=conversation.escalated if conversation else "None")
+            event.processing_status = "processed"
+            event.processed_at = datetime.now(timezone.utc)
             await session.commit()
             return
 
-        # Load recent messages for LLM context
+        # 3. CONTEXT & AI CALL
         messages = await get_recent_messages(session, conversation_id)
         llm_messages = build_llm_messages(messages)
 
         if not llm_messages:
-            logger.warning("no_messages_for_llm", conv_id=conversation_id)
-            await _mark_event_done(session, inbound_event_id)
+            event.processing_status = "processed"
             await session.commit()
             return
 
-        # Call OpenAI
         try:
             ai_output = await call_openai(llm_messages, conversation_id)
         except Exception as exc:
             logger.error("openai_call_failed", conv_id=conversation_id, error=str(exc))
-            # Write a fallback outbound message
-            error_reply = (
-                "شكراً على تواصلك 🙏 واجهنا مشكل تقني صغير. سنعود إليك قريباً."
-                "\n\nMerci de votre contact. Un problème technique est survenu. Nous revenons vers vous très bientôt."
-            )
-            await _write_outbound(session, conversation_id, error_reply, event_id=inbound_event_id)
-            await _mark_event_done(session, inbound_event_id)
+            error_reply = "Désolé, un problème technique est survenu. Nous revenons vers vous bientôt."
+            await _write_outbound(session, conversation_id, error_reply, inbound_event_id)
+            event.processing_status = "processed"
             await session.commit()
             return
 
         # Handle needs_human flag
         if ai_output.needs_human or ai_output.confidence < 0.6:
-            reason = ai_output.needs_human_reason or "low_confidence"
-            handoff_result = await execute_tool(
-                "create_human_handoff",
-                {"reason": reason, "reason_text": ai_output.needs_human_reason},
-                session,
-                conversation_id,
-                customer_id,
-            )
-            logger.info("human_handoff_triggered", conv_id=conversation_id, reason=reason)
+            await execute_tool("create_human_handoff", {"reason_text": ai_output.needs_human_reason}, session, conversation_id, customer_id)
 
-        # Execute proposed actions sequentially
-        tool_results: list[dict] = []
+        # Execute proposed actions
+        tool_results = []
         for action in ai_output.proposed_actions:
-            result = await execute_tool(
-                action.type,
-                action.params,
-                session,
-                conversation_id,
-                customer_id,
-            )
+            result = await execute_tool(action.type, action.params, session, conversation_id, customer_id)
             tool_results.append({"tool": action.type, "result": result})
+            if action.type == "create_human_handoff": break
 
-            # If escalation was triggered, stop processing further actions
-            if action.type == "create_human_handoff":
-                break
+        # Follow-up if tools ran
+        if tool_results:
+            import json as _json
+            augmented_messages = llm_messages + [
+                {"role": "assistant", "content": ai_output.model_dump_json()},
+                {"role": "user", "content": f"[SYSTEM: Tool Results]\n{_json.dumps(tool_results, ensure_ascii=False)}\nNow respond."}
+            ]
+            try:
+                ai_output = await call_openai(augmented_messages, conversation_id)
+            except Exception:
+                pass 
 
-        # Write the customer-facing reply to the outbox
+        # Write outbound WITH raw_payload for history!
         reply = ai_output.customer_facing_reply
         if reply:
-            await _write_outbound(session, conversation_id, reply, event_id=inbound_event_id)
+            await _write_outbound(session, conversation_id, reply, inbound_event_id, raw_payload=ai_output.model_dump())
 
-        # Update conversation last_outbound_at
+        # Update and commit
         conversation.last_outbound_at = datetime.now(timezone.utc)
-
-        # Update inbound_event
-        await _mark_event_done(session, inbound_event_id)
-
+        event.processing_status = "processed"
+        event.processed_at = datetime.now(timezone.utc)
         await session.commit()
 
     logger.info("process_inbound_done", event_id=inbound_event_id, conv_id=conversation_id)
@@ -164,36 +166,38 @@ async def _write_outbound(
     body: str,
     event_id: str,
     media_url: str | None = None,
+    raw_payload: dict | None = None,
 ) -> None:
     from app.models.outbound_message import OutboundMessage
+    from app.models.message import Message
     from sqlalchemy.exc import IntegrityError
 
-    dedupe_key = compute_dedupe_key(conversation_id, event_id, body[:50])
-    msg = OutboundMessage(
-        conversation_id=uuid.UUID(conversation_id),
-        dedupe_key=dedupe_key,
-        body_text=body,
-        media_url=media_url,
-        send_status="pending",
-    )
-    session.add(msg)
-    try:
-        await session.flush()
-    except IntegrityError:
-        await session.rollback()
-        logger.info("outbound_deduplicated", dedupe_key=dedupe_key[:16])
+    async with session.begin_nested():
+        dedupe_key = compute_dedupe_key(conversation_id, event_id, body[:50])
+        msg = OutboundMessage(
+            conversation_id=uuid.UUID(conversation_id),
+            dedupe_key=dedupe_key,
+            body_text=body,
+            media_url=media_url,
+            send_status="pending",
+        )
+        session.add(msg)
+        
+        # Save to history immediately WITH the metadata!
+        history_msg = Message(
+            conversation_id=uuid.UUID(conversation_id),
+            direction="outbound",
+            provider="twilio",
+            body_text=body,
+            raw_payload=raw_payload, # THE KEY FIX
+            message_type="text",
+        )
+        session.add(history_msg)
 
-
-async def _mark_event_done(session, event_id: str) -> None:
-    from app.models.inbound_event import InboundEvent
-    from sqlalchemy import select
-    result = await session.execute(
-        select(InboundEvent).where(InboundEvent.id == uuid.UUID(event_id))
-    )
-    event = result.scalar_one_or_none()
-    if event:
-        event.processing_status = "processed"
-        event.processed_at = datetime.now(timezone.utc)
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
 
 
 async def _mark_event_failed(event_id: str, error: str) -> None:

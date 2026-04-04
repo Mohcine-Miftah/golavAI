@@ -2,6 +2,7 @@
 app/services/conversation_service.py — Conversation and customer context management.
 """
 import uuid
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -63,14 +64,16 @@ async def get_or_create_conversation(session: AsyncSession, customer_id: str) ->
 
 
 async def get_recent_messages(session: AsyncSession, conversation_id: str) -> list[Message]:
-    """Return the last N messages for building the LLM context."""
+    """Return the last N messages for building the LLM context, in chronological order."""
     result = await session.execute(
         select(Message)
         .where(Message.conversation_id == uuid.UUID(conversation_id))
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.desc())
         .limit(RECENT_MESSAGE_LIMIT)
     )
-    return list(result.scalars().all())
+    messages = list(result.scalars().all())
+    messages.reverse()  # LLM needs oldest first, newest last
+    return messages
 
 
 async def get_open_booking(session: AsyncSession, conversation_id: str) -> Booking | None:
@@ -91,13 +94,28 @@ async def get_open_booking(session: AsyncSession, conversation_id: str) -> Booki
 def build_llm_messages(messages: list[Message]) -> list[dict[str, str]]:
     """
     Convert Message rows to the OpenAI messages format.
-    Inbound → role=user, outbound → role=assistant.
+
+    THE KEY FIX: For assistant (outbound) messages, we look for 'raw_payload'.
+    If found, we use the original structured JSON. This allows the AI to 
+    maintain context of extracted entities (address, car model, etc.) across turns.
     """
     result = []
     for m in messages:
-        role = "user" if m.direction == "inbound" else "assistant"
-        content = m.body_text or ""
-        result.append({"role": role, "content": content})
+        if m.direction == "inbound":
+            result.append({"role": "user", "content": m.body_text or ""})
+        else:
+            # Outbound / Assistant message
+            if m.raw_payload:
+                # Restore the structured thought so the AI remembers its progress
+                # Using json.dumps ensures it's a valid string for the 'content' field
+                try:
+                    metadata_content = json.dumps(m.raw_payload, ensure_ascii=False)
+                    result.append({"role": "assistant", "content": metadata_content})
+                except Exception:
+                    # Fallback to plain text if JSON serialization fails
+                    result.append({"role": "assistant", "content": m.body_text or ""})
+            else:
+                result.append({"role": "assistant", "content": m.body_text or ""})
     return result
 
 

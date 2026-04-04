@@ -80,7 +80,6 @@ async def execute_tool(
             result = await confirm_booking(
                 session=session,
                 conversation_id=conversation_id,
-                hold_id=params["hold_id"],
                 vehicle_category=params["vehicle_category"],
                 service_type=params["service_type"],
                 address_text=params["address_text"],

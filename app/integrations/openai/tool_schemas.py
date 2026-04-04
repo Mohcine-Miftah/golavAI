@@ -7,6 +7,8 @@ The app layer executes the actual implementations in services/.
 from typing import Any
 
 # Each tool schema follows the OpenAI function tool format.
+# NOTE: When strict=True, ALL parameters objects must include
+# "additionalProperties": false — this is enforced by the API.
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -16,7 +18,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "Returns GOLAV's business policies, FAQ, working hours, and service description. "
                 "Call this when the customer asks how the service works, what you do, or any policy question."
             ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
             "strict": True,
         },
     },
@@ -37,6 +44,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     }
                 },
                 "required": ["city_or_address"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -58,6 +66,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     }
                 },
                 "required": ["vehicle_text"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -85,6 +94,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["vehicle_category", "service_type"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -110,6 +120,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["date", "area_name"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -136,6 +147,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["conversation_id", "slot"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -157,9 +169,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "service_type": {"type": "string", "enum": ["exterieur", "complet"]},
                     "address_text": {"type": "string"},
                     "area_name": {"type": "string"},
-                    "vehicle_model": {"type": ["string", "null"]},
+                    "vehicle_model": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Vehicle model name, or null if unknown.",
+                    },
                 },
-                "required": ["conversation_id", "hold_id", "vehicle_category", "service_type", "address_text", "area_name"],
+                "required": ["conversation_id", "hold_id", "vehicle_category", "service_type", "address_text", "area_name", "vehicle_model"],
                 "additionalProperties": False,
             },
             "strict": True,
@@ -177,6 +192,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "reason": {"type": "string", "description": "Reason for cancellation."},
                 },
                 "required": ["booking_id", "reason"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -193,6 +209,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "new_slot": {"type": "string", "description": "New ISO datetime slot."},
                 },
                 "required": ["booking_id", "new_slot"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -208,6 +225,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "conversation_id": {"type": "string"},
                 },
                 "required": ["conversation_id"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
@@ -234,7 +252,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "Human-readable explanation for the handoff.",
                     },
                 },
-                "required": ["conversation_id", "reason"],
+                "required": ["conversation_id", "reason", "reason_text"],
                 "additionalProperties": False,
             },
             "strict": True,
@@ -251,6 +269,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "conversation_id": {"type": "string"},
                 },
                 "required": ["conversation_id"],
+                "additionalProperties": False,
             },
             "strict": True,
         },
