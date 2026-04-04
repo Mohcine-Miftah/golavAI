@@ -1,12 +1,5 @@
 """
 app/services/tool_executor.py — Application-layer tool execution bridge.
-
-When the AI returns proposed_actions (tool calls), this module executes them
-in deterministic Python code. The LLM never directly touches the database.
-
-Each tool returns a structured dict result which is:
-1. Used to build a follow-up message
-2. Logged for auditability
 """
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -41,15 +34,22 @@ Pour toute réclamation, contactez-nous directement.
 
 async def execute_tool(
     tool_name: str,
-    params: dict,
+    params: any,
     session: AsyncSession,
     conversation_id: str,
     customer_id: str,
 ) -> dict:
     """
     Execute a single tool call and return a result dict.
-    All errors are caught and returned as {"error": ..., "success": False}.
     """
+    # Normalize params to dict if it's a Pydantic model (Strict Mode)
+    if hasattr(params, "model_dump"):
+        params = params.model_dump()
+    elif not isinstance(params, dict) and params is not None:
+        params = dict(params)
+    elif params is None:
+        params = {}
+
     try:
         logger.info("tool_execute", tool=tool_name, params=params, conversation_id=conversation_id)
 
@@ -65,24 +65,25 @@ async def execute_tool(
         elif tool_name == "get_price":
             price = await get_price(
                 session,
-                params["vehicle_category"],
-                params["service_type"],
+                params.get("vehicle_category"),
+                params.get("service_type"),
             )
             return {"price_mad": float(price), "currency": "MAD", "success": True}
 
         elif tool_name == "get_available_slots":
-            return await get_available_slots(session, params["date"], params.get("area_name", "mohammedia"))
+            # Fixed: Use .get() for safety
+            return await get_available_slots(session, params.get("date"), params.get("area_name", "mohammedia"))
 
         elif tool_name == "create_slot_hold":
-            return await create_slot_hold(session, conversation_id, params["slot"])
+            return await create_slot_hold(session, conversation_id, params.get("slot"))
 
         elif tool_name == "confirm_booking":
             result = await confirm_booking(
                 session=session,
                 conversation_id=conversation_id,
-                vehicle_category=params["vehicle_category"],
-                service_type=params["service_type"],
-                address_text=params["address_text"],
+                vehicle_category=params.get("vehicle_category"),
+                service_type=params.get("service_type"),
+                address_text=params.get("address_text"),
                 area_name=params.get("area_name", "mohammedia"),
                 customer_id=customer_id,
                 vehicle_model=params.get("vehicle_model"),
@@ -110,12 +111,11 @@ async def execute_tool(
                     booking_id = str(booking.id)
             if not booking_id:
                 return {"success": False, "message": "No active booking found to reschedule."}
-            result = await reschedule_booking(session, booking_id, params["new_slot"], conversation_id)
+            result = await reschedule_booking(session, booking_id, params.get("new_slot"), conversation_id)
             await session.commit()
             return result
 
         elif tool_name == "send_price_card":
-            # The actual media is sent via outbound_message with media_url
             prices = await get_all_prices(session)
             return {"success": True, "prices": prices, "send_media": True}
 
